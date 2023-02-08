@@ -42,6 +42,45 @@ class TensorVM(TensorBase):
         app_features = self.basis_mat((plane_feats * line_feats).T)
         
         return sigma_feature, app_features
+        
+        
+        
+    def compute_densityfeature_convolved(self, xyz_sampled, kernel_size, kernel_sigma):
+        coordinate_plane = torch.stack((xyz_sampled[..., self.matMode[0]], xyz_sampled[..., self.matMode[1]], xyz_sampled[..., self.matMode[2]])).detach().view(3, -1, 1, 2)
+        coordinate_line = torch.stack((xyz_sampled[..., self.vecMode[0]], xyz_sampled[..., self.vecMode[1]], xyz_sampled[..., self.vecMode[2]]))
+        coordinate_line = torch.stack((torch.zeros_like(coordinate_line), coordinate_line), dim=-1).detach().view(3, -1, 1, 2)
+        
+        
+        kernel_x = self.get_gaussian_kern(kernel_size[0], self.units[0], kernel_sigma[0])
+        kernel_y = self.get_gaussian_kern(kernel_size[1], self.units[1], kernel_sigma[1])
+        kernel_z = self.get_gaussian_kern(kernel_size[2], self.units[2], kernel_sigma[2])
+        
+        kernel_xy = torch.outer(kernel_x, kernel_y).view(1, 1, kernel_size[0], kernel_size[1])
+        kernel_xz = torch.outer(kernel_x, kernel_z).view(1, 1, kernel_size[0], kernel_size[2])
+        kernel_yz = torch.outer(kernel_y, kernel_z).view(1, 1, kernel_size[1], kernel_size[2])
+        
+        plane_filteredxy = F.conv2d(self.plane_coef[:1, -self.density_n_comp:], kernel_xy.expand(self.density_n_comp, -1, -1, -1))
+        plane_filteredxz = F.conv2d(self.plane_coef[1:2, -self.density_n_comp:], kernel_xz.expand(self.density_n_comp, -1, -1, -1))
+        plane_filteredyz = F.conv2d(self.plane_coef[2:, -self.density_n_comp:], kernel_yz.expand(self.density_n_comp, -1, -1, -1))
+        
+        line_filtered_x = F.conv1d(self.line_coef[:1, -self.density_n_comp:], kernel_x.view(1, 1, -1).expand(self.density_n_comp, -1, -1) )
+        line_filtered_y = F.conv1d(self.line_coef[1:2, -self.density_n_comp:], kernel_y.view(1, 1, -1).expand(self.density_n_comp, -1, -1) )
+        line_filtered_z = F.conv1d(self.line_coef[2:, -self.density_n_comp:], kernel_z.view(1, 1, -1).expand(self.density_n_comp, -1, -1) )
+        
+        plane_coef = torch.stack([plane_filteredxy, plane_filteredxz, plane_filteredyz])
+        line_coef = torch.stack([line_filtered_x, line_filtered_y, line_filtered_z])
+
+        plane_feats = F.grid_sample(plane_coef[:, -self.density_n_comp:], coordinate_plane, align_corners=True).view(
+                                        -1, *xyz_sampled.shape[:1])
+                                        
+        
+        line_feats = F.grid_sample(line_coef[:, -self.density_n_comp:], coordinate_line, align_corners=True).view(
+                                        -1, *xyz_sampled.shape[:1])
+        
+        sigma_feature = torch.sum(plane_feats * line_feats, dim=0)
+        
+        
+        return sigma_feature
 
     def compute_densityfeature(self, xyz_sampled):
         coordinate_plane = torch.stack((xyz_sampled[..., self.matMode[0]], xyz_sampled[..., self.matMode[1]], xyz_sampled[..., self.matMode[2]])).detach().view(3, -1, 1, 2)
@@ -201,6 +240,38 @@ class TensorVMSplit(TensorBase):
         for idx in range(len(self.app_plane)):
             total = total + reg(self.app_plane[idx]) * 1e-2 #+ reg(self.app_line[idx]) * 1e-3
         return total
+        
+    def compute_densityfeature_convolved(self, xyz_sampled, kernel_size, kernel_sigma):
+        # plane + line basis
+        coordinate_plane = torch.stack((xyz_sampled[..., self.matMode[0]], xyz_sampled[..., self.matMode[1]], xyz_sampled[..., self.matMode[2]])).detach().view(3, -1, 1, 2)
+        coordinate_line = torch.stack((xyz_sampled[..., self.vecMode[0]], xyz_sampled[..., self.vecMode[1]], xyz_sampled[..., self.vecMode[2]]))
+        coordinate_line = torch.stack((torch.zeros_like(coordinate_line), coordinate_line), dim=-1).detach().view(3, -1, 1, 2)
+
+        sigma_feature = torch.zeros((xyz_sampled.shape[0],), device=xyz_sampled.device)
+        for idx_plane in range(len(self.density_plane)):
+            i1, i2 = self.matMode[idx_plane]
+            li = self.vecMode[idx_plane]
+            df = self.density_plane[idx_plane].shape[1]
+            
+            kernel1 = self.get_gaussian_kern(kernel_size[i1], self.units[i1], kernel_sigma[..., i1]).squeeze() #[Nq, s]
+            kernel2 = self.get_gaussian_kern(kernel_size[i2], self.units[i2], kernel_sigma[..., i2]).squeeze() #[Nq, s]
+            
+            line_kernel = self.get_gaussian_kern(kernel_size[li], self.units[li], kernel_sigma[..., li]).squeeze()
+            line_kernel = line_kernel.view(-1, 1, kernel_size[li]).repeat(df, df, 1)
+            
+            kernel = torch.matmul(kernel1[:, :, None], kernel2[:, None, :]).view(-1, 1, kernel_size[i1], kernel_size[i2])
+            kernel = kernel.repeat(df, df, 1, 1) # [Nq*density_features, 1, kh, kw]
+            
+            plane_filtered = F.conv2d(self.density_plane[idx_plane], kernel) # [1, Nq*density_features, h, w]
+            line_filtered = F.conv1d(self.density_line[idx_plane][:, :, :, 0], line_kernel) # #[1, Nq*density_features, l]
+            
+            plane_coef_point = F.grid_sample(plane_filtered, coordinate_plane[[idx_plane]], 
+                                                align_corners=True).view(-1, *xyz_sampled.shape[:1]) # [Nq*df, Nq]
+            line_coef_point = F.grid_sample(line_filtered[..., None], coordinate_line[[idx_plane]],
+                                            align_corners=True).view(-1, *xyz_sampled.shape[:1]) # [Nq*df, Nq, ]
+            sigma_feature = sigma_feature + torch.sum(plane_coef_point * line_coef_point, dim=0)
+
+        return sigma_feature
 
     def compute_densityfeature(self, xyz_sampled):
 

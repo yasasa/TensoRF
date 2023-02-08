@@ -406,8 +406,12 @@ class TensorBase(torch.nn.Module):
         return alpha
 
 
+    def get_gaussian_kern(self, size, scale, sigma): # [nrays, nsamples]
+        kernel_x = torch.linspace(-size/2, size/2., size).type_as(sigma) * scale # [size]
+        log_kernel_x = -kernel_x[None, None, :]**2 / (sigma[..., None]**2)
+        return torch.exp(log_kernel_x)
+        
     def forward(self, rays_chunk, white_bg=True, is_train=False, ndc_ray=False, N_samples=-1):
-
         # sample points
         viewdirs = rays_chunk[:, 3:6]
         if ndc_ray:
@@ -431,10 +435,17 @@ class TensorBase(torch.nn.Module):
 
         sigma = torch.zeros(xyz_sampled.shape[:-1], device=xyz_sampled.device)
         rgb = torch.zeros((*xyz_sampled.shape[:2], 3), device=xyz_sampled.device)
+        
 
         if ray_valid.any():
             xyz_sampled = self.normalize_coord(xyz_sampled)
-            sigma_feature = self.compute_densityfeature(xyz_sampled[ray_valid])
+            
+            depths = (xyz_sampled - self.normalize_coord(rays_chunk[:, :3])[:, None, :]).norm(dim=-1)
+            
+            kernel_size = torch.tensor([10, 10, 10], device=xyz_sampled.device)
+            kernel_sigma = depths[..., None] / 10. * torch.ones(3, device=xyz_sampled.device)
+            sigma_feature = self.compute_densityfeature_convolved(xyz_sampled[ray_valid], kernel_size, kernel_sigma[ray_valid])
+            
 
             validsigma = self.feature2density(sigma_feature)
             sigma[ray_valid] = validsigma
