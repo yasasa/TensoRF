@@ -247,28 +247,47 @@ class TensorVMSplit(TensorBase):
         coordinate_line = torch.stack((xyz_sampled[..., self.vecMode[0]], xyz_sampled[..., self.vecMode[1]], xyz_sampled[..., self.vecMode[2]]))
         coordinate_line = torch.stack((torch.zeros_like(coordinate_line), coordinate_line), dim=-1).detach().view(3, -1, 1, 2)
 
+        conv_levels = 32
+
+        levels = (kernel_sigma[:, 0].max()) / conv_levels
+        sigmas = (torch.arange(conv_levels).type_as(xyz_sampled) + 1) * levels
+      #  print(sigmas)
+
         sigma_feature = torch.zeros((xyz_sampled.shape[0],), device=xyz_sampled.device)
         for idx_plane in range(len(self.density_plane)):
             i1, i2 = self.matMode[idx_plane]
             li = self.vecMode[idx_plane]
             df = self.density_plane[idx_plane].shape[1]
             
-            kernel1 = self.get_gaussian_kern(kernel_size[i1], self.units[i1], kernel_sigma[..., i1]).squeeze() #[Nq, s]
-            kernel2 = self.get_gaussian_kern(kernel_size[i2], self.units[i2], kernel_sigma[..., i2]).squeeze() #[Nq, s]
+            kernel1 = self.get_gaussian_kern(kernel_size[i1], self.units[i1], sigmas) #[Nq, s]
+            kernel2 = self.get_gaussian_kern(kernel_size[i2], self.units[i2], sigmas) #[Nq, s]
             
-            line_kernel = self.get_gaussian_kern(kernel_size[li], self.units[li], kernel_sigma[..., li]).squeeze()
-            line_kernel = line_kernel.view(-1, 1, kernel_size[li]).repeat(df, df, 1)
+            line_kernel = self.get_gaussian_kern(kernel_size[li], self.units[li], sigmas)
+            line_kernel = line_kernel.view(-1, 1, kernel_size[li]).repeat(df, 1, 1)
             
             kernel = torch.matmul(kernel1[:, :, None], kernel2[:, None, :]).view(-1, 1, kernel_size[i1], kernel_size[i2])
-            kernel = kernel.repeat(df, df, 1, 1) # [Nq*density_features, 1, kh, kw]
+            kernel = kernel.repeat(df, 1, 1, 1) # [Nq*density_features, 1, kh, kw]
+ 
+            plane_filtered = F.conv2d(self.density_plane[idx_plane], kernel, groups=df) # [1, Nq*density_features, h, w]
+            line_filtered = F.conv1d(self.density_line[idx_plane][:, :, :, 0], line_kernel, groups=df) # #[1, Nq*density_features, l]
+        #   plane_filtered = self.density_line[idx_plane]
+        #   line_filtered = self.density_line[idx_plane][..., 0]
+            plane_filtered = plane_filtered.view(df, conv_levels, *plane_filtered.shape[-2:]).permute(1, 0, 2, 3).reshape(-1, *plane_filtered.shape[2:])
+            line_filtered = line_filtered.view(df, conv_levels, *line_filtered.shape[-1:]).permute(1, 0, 2).reshape(-1, *line_filtered.shape[-1:])
+
+            plane_coef_point = F.grid_sample(plane_filtered[None], coordinate_plane[[idx_plane]], 
+                                                align_corners=True).view(conv_levels, df, -1)  # [levels, df, Nq, 1]
+            line_coef_point = F.grid_sample(line_filtered[None, ..., None], coordinate_line[[idx_plane]],
+                                            align_corners=True).view(conv_levels, df, -1) # [Nq*df, Nq, ]
+
+            indices = (kernel_sigma[:, 0][..., None] - sigmas[None]).abs().argmin(dim=-1)
+      #      print(indices)
+
             
-            plane_filtered = F.conv2d(self.density_plane[idx_plane], kernel) # [1, Nq*density_features, h, w]
-            line_filtered = F.conv1d(self.density_line[idx_plane][:, :, :, 0], line_kernel) # #[1, Nq*density_features, l]
+            plane_coef_point = plane_coef_point.gather(0, indices.view(1, 1, -1 ).expand(-1, df, -1)).squeeze()
+            line_coef_point = line_coef_point.gather(0, indices.view(1, 1, -1).expand(-1, df, -1)).squeeze()
+
             
-            plane_coef_point = F.grid_sample(plane_filtered, coordinate_plane[[idx_plane]], 
-                                                align_corners=True).view(-1, *xyz_sampled.shape[:1]) # [Nq*df, Nq]
-            line_coef_point = F.grid_sample(line_filtered[..., None], coordinate_line[[idx_plane]],
-                                            align_corners=True).view(-1, *xyz_sampled.shape[:1]) # [Nq*df, Nq, ]
             sigma_feature = sigma_feature + torch.sum(plane_coef_point * line_coef_point, dim=0)
 
         return sigma_feature
